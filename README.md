@@ -41,10 +41,11 @@ systemctl restart 3x-ui
 - 检测 Nginx 是否占用 80 / 443 端口
 - 判断 acme.sh 是否是 standalone / Webroot / DNS API 模式
 - 如果检测到 `standalone + Nginx 占用 80`：
-  - 优先尝试切换到 Webroot 模式
-  - 如果 Webroot 不满足条件，则自动配置续签 hook：
-    - 续签前停止 Nginx
-    - 续签后启动 Nginx
+  - 优先尝试修复 Nginx Webroot challenge
+  - 自动 reload Nginx，不停止 Nginx
+  - 自动切换 acme.sh 到 Webroot 模式
+  - 如果旧版本脚本曾写入 stop/start Nginx hook，新版会自动移除
+  - 如果 Webroot 修复失败，不再自动配置停止 Nginx 的 hook，避免影响网站运行
 
 ---
 
@@ -259,17 +260,45 @@ FIX : 1
 
 如果是 standalone 模式，并且 80 端口被 Nginx 占用，脚本会：
 
-1. 优先尝试检测 Nginx Webroot；
-2. 测试 `/.well-known/acme-challenge/` 是否公网可访问；
-3. 如果可用，尝试切换为 Webroot 模式；
-4. 如果不可用，则配置 acme.sh hook：
+1. 检测 Nginx 中当前域名对应的 `server_name` 和 `root`；
+2. 创建 `/.well-known/acme-challenge/` 目录；
+3. 测试 HTTP-01 challenge 是否能公网访问；
+4. 如果测试失败，自动在对应 Nginx `server` 块中插入 challenge location；
+5. 执行 `nginx -t` 检查配置；
+6. 只在配置测试通过后执行 `systemctl reload nginx`，不会停止 Nginx；
+7. 再次测试 challenge；
+8. 测试通过后，把 acme.sh 切换到 Webroot 模式并重新签发证书；
+9. 如果旧版本脚本曾写入 `Le_PreHook` / `Le_PostHook` 停止或启动 Nginx，新版会自动移除。
 
-```bash
-Le_PreHook='systemctl stop nginx || true'
-Le_PostHook='systemctl start nginx || true'
+目标是让后续证书续签走 Webroot，不占用 80 端口，也不停止网站服务。
+
+如果 Webroot 自动修复失败，脚本会给出 `FAIL` 和具体建议，但**不会再自动配置 stop/start Nginx hook**，避免影响正在运行的网站。
+
+---
+
+## Webroot 修复策略说明
+
+新版脚本的原则是：**不停止 Nginx，不影响网站运行**。
+
+当检测到 `standalone + Nginx 占用 80` 时，脚本会优先修复 Webroot：
+
+```nginx
+location ^~ /.well-known/acme-challenge/ {
+    root /var/www/html;
+    default_type "text/plain";
+    try_files $uri =404;
+}
 ```
 
-这样可以避免 standalone 续签时因为 80 端口被 Nginx 占用而失败。
+实际 `root` 会根据 Nginx 配置中检测到的网站根目录自动填写。
+
+脚本会先备份 Nginx 配置，再插入规则。只有 `nginx -t` 通过后，才会执行：
+
+```bash
+systemctl reload nginx
+```
+
+如果配置测试失败，脚本会自动恢复备份。
 
 ---
 
@@ -318,5 +347,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/ma
 - 脚本会修改 acme.sh 的 install-cert 配置。
 - 脚本可能会修改 x-ui 数据库中的证书路径，但会先自动备份数据库。
 - 如果需要从 standalone 切换到 Webroot，脚本可能会触发一次重新签发证书。
-- 如果 Webroot 不满足条件，脚本会配置 Nginx stop/start hook 作为兜底。
+- 如果 Webroot 不满足条件，脚本不会再配置 Nginx stop/start hook，避免影响正在运行的网站。
 - 建议第一次运行后，再运行第二次确认状态是否稳定。
