@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # x-ui / 3x-ui SSL Auto Check & Repair
-# Webroot-first edition: fixes acme.sh standalone + Nginx:80 by repairing Webroot.
-# It does NOT stop Nginx.
+# Webroot-first edition: repairs acme.sh standalone + Nginx:80 without stopping Nginx.
 
 set +e
 
@@ -33,6 +32,7 @@ x-ui / 3x-ui SSL 自动检测与修复工具
 
 说明：
   - 示例域名 tim.google.com 仅用于格式说明。
+  - 脚本会自动检测 x-ui / 3x-ui、面板端口、证书路径、acme.sh 续签配置、Nginx 80 端口占用。
   - 新版优先修复 Webroot，不会自动停止 Nginx。
 HELP
 }
@@ -294,25 +294,29 @@ test_webroot_challenge(){
     local challenge_dir="${webroot}/.well-known/acme-challenge"
     local token="xui-ssl-check-$(date +%s)-$RANDOM"
     local content="ok-${token}"
+    local body_file="/tmp/xui_ssl_challenge_body_${RANDOM}.txt"
     mkdir -p "$challenge_dir"
     echo "$content" > "${challenge_dir}/${token}"
     chmod 644 "${challenge_dir}/${token}" 2>/dev/null || true
 
     local url="http://${DOMAIN}/.well-known/acme-challenge/${token}"
-    local result=""
+    local code="000"
     if [ "$mode" = "local" ]; then
-        result="$(curl -k -sL --max-time 15 --resolve "${DOMAIN}:80:127.0.0.1" --resolve "${DOMAIN}:443:127.0.0.1" "$url" || true)"
+        code="$(curl -k -sL -o "$body_file" -w "%{http_code}" --max-time 15 --resolve "${DOMAIN}:80:127.0.0.1" --resolve "${DOMAIN}:443:127.0.0.1" "$url" || echo "000")"
     else
-        result="$(curl -k -sL --max-time 15 "$url" || true)"
+        code="$(curl -k -sL -o "$body_file" -w "%{http_code}" --max-time 15 "$url" || echo "000")"
     fi
 
-    rm -f "${challenge_dir:?}/${token}"
+    local result preview
+    result="$(cat "$body_file" 2>/dev/null)"
+    preview="$(head -c 120 "$body_file" 2>/dev/null | tr '\n' ' ')"
+    rm -f "${challenge_dir:?}/${token}" "$body_file"
 
     if [ "$result" = "$content" ]; then
         if [ "$mode" = "local" ]; then pass "Webroot challenge 本机 Nginx 访问测试通过"; else pass "Webroot challenge 公网访问测试通过"; fi
         return 0
     else
-        if [ "$mode" = "local" ]; then warn "Webroot challenge 本机 Nginx 访问测试失败"; else warn "Webroot challenge 公网访问测试失败"; fi
+        if [ "$mode" = "local" ]; then warn "Webroot challenge 本机 Nginx 访问测试失败，HTTP状态码：$code，响应预览：$preview"; else warn "Webroot challenge 公网访问测试失败，HTTP状态码：$code，响应预览：$preview"; fi
         return 1
     fi
 }
@@ -362,71 +366,127 @@ repair_nginx_webroot_challenge(){
 import os, re, sys
 from pathlib import Path
 
-domain=os.environ["DOMAIN"]; webroot=os.environ["WEBROOT"]; conf=Path(os.environ["NGINX_CONF_FILE"])
+domain=os.environ["DOMAIN"]
+webroot=os.environ["WEBROOT"]
+conf=Path(os.environ["NGINX_CONF_FILE"])
 text=conf.read_text()
 lines=text.splitlines(True)
-out=[]; idx=0; changed=False
+out=[]
+idx=0
+changed=False
 server_re=re.compile(r"\bserver\s*\{")
 
-def depth_delta(s): return s.count("{")-s.count("}")
+def depth_delta(s):
+    return s.count("{")-s.count("}")
 
+def block_has_listen80(block_text):
+    # no listen means implicit port 80 in nginx
+    if not re.search(r"listen\s+", block_text):
+        return True
+    return bool(re.search(r"listen\s+[^;]*(:)?80\b", block_text))
+
+def block_has_domain(block_text):
+    return bool(re.search(r"server_name\s+[^;]*\b"+re.escape(domain)+r"\b", block_text))
+
+# First collect server blocks so we can know whether there is an exact domain:80 block.
+blocks=[]
 while idx < len(lines):
     line=lines[idx]
     if not server_re.search(line):
-        out.append(line); idx+=1; continue
-
-    block=[line]; depth=depth_delta(line); idx+=1
+        blocks.append((False,[line],False,False))
+        idx+=1
+        continue
+    block=[line]
+    depth=depth_delta(line)
+    idx+=1
     while idx < len(lines) and depth > 0:
-        block.append(lines[idx]); depth += depth_delta(lines[idx]); idx+=1
+        block.append(lines[idx])
+        depth += depth_delta(lines[idx])
+        idx+=1
+    bt="".join(block)
+    blocks.append((True,block,block_has_listen80(bt),block_has_domain(bt)))
 
-    block_text="".join(block)
-    has_domain=re.search(r"server_name\s+[^;]*\b"+re.escape(domain)+r"\b", block_text)
-    if not has_domain:
-        out.extend(block); continue
+has_exact_80_domain=any(is_server and listen80 and has_domain for is_server,block,listen80,has_domain in blocks)
 
-    listen80=bool(re.search(r"listen\s+[^;]*\b80\b", block_text)) or not re.search(r"listen\s+", block_text)
-    if listen80:
-        newblock=[]; inner_depth=0
-        for n,line2 in enumerate(block):
-            stripped=line2.strip()
-            if n==0:
-                newblock.append(line2); inner_depth += depth_delta(line2); continue
-            if inner_depth==1 and re.match(r"return\s+30[1278]\s+", stripped):
-                indent=line2[:len(line2)-len(line2.lstrip())]
-                newblock.append(f"{indent}location / {{\n")
-                newblock.append(f"{indent}    {stripped}\n")
-                newblock.append(f"{indent}}}\n")
-                changed=True
-            else:
-                newblock.append(line2)
-            inner_depth += depth_delta(line2)
-        block=newblock
-        block_text="".join(block)
+def repair_block(block):
+    global changed
+    bt="".join(block)
+    # Insert challenge location if missing in this block.
+    location = (
+        "\n"
+        "    # Added by xui-ssl-auto-check for acme.sh Webroot renewal\n"
+        "    location ^~ /.well-known/acme-challenge/ {\n"
+        f"        root {webroot};\n"
+        "        default_type \"text/plain\";\n"
+        "        try_files $uri =404;\n"
+        "    }\n"
+    )
 
-    if ".well-known/acme-challenge" not in block_text:
-        insert=(
-            "\n"
-            "    # Added by xui-ssl-auto-check for acme.sh Webroot renewal\n"
-            "    location ^~ /.well-known/acme-challenge/ {\n"
-            f"        root {webroot};\n"
-            "        default_type \"text/plain\";\n"
-            "        try_files $uri =404;\n"
-            "    }\n"
-        )
-        for j in range(len(block)-1, -1, -1):
-            if "}" in block[j]:
-                block.insert(j, insert); changed=True; break
+    new=[]
+    inner_depth=0
+    for n,line in enumerate(block):
+        if n==0:
+            new.append(line)
+            inner_depth += depth_delta(line)
+            continue
+        stripped=line.strip()
+        # Nginx server-level return/rewrite runs before location and can break HTTP-01.
+        # Move top-level redirect into location / so challenge location can win.
+        is_top_level = (inner_depth == 1)
+        is_return_redirect = bool(re.match(r"return\s+30[1278]\s+", stripped))
+        is_rewrite_redirect = bool(re.match(r"rewrite\s+.*\s+(permanent|redirect)\s*;", stripped))
+        if is_top_level and (is_return_redirect or is_rewrite_redirect):
+            indent=line[:len(line)-len(line.lstrip())]
+            new.append(f"{indent}location / {{\n")
+            new.append(f"{indent}    {stripped}\n")
+            new.append(f"{indent}}}\n")
+            changed=True
+        else:
+            new.append(line)
+        inner_depth += depth_delta(line)
 
-    out.extend(block)
+    bt2="".join(new)
+    if ".well-known/acme-challenge" not in bt2:
+        # Put it right after the opening server line, before other location/rewrite logic.
+        new.insert(1, location)
+        changed=True
+    return new
+
+for is_server,block,listen80,has_domain in blocks:
+    if not is_server:
+        out.extend(block)
+        continue
+    # Prefer exact server_name+80 blocks. If none exists, repair all 80 blocks in the same file
+    # because the domain may be handled by default_server or a catch-all redirect block.
+    if listen80 and ((has_exact_80_domain and has_domain) or (not has_exact_80_domain)):
+        out.extend(repair_block(block))
+    else:
+        out.extend(block)
 
 if not changed:
-    print("No Nginx changes needed or no matching editable server block found", file=sys.stderr)
+    # As a final fallback, append a dedicated HTTP server block. This may be ignored if a previous
+    # duplicate server_name exists, but it helps when only HTTPS server blocks were present.
+    out.append(
+        "\n"
+        "# Added by xui-ssl-auto-check for acme.sh Webroot renewal\n"
+        "server {\n"
+        "    listen 80;\n"
+        "    listen [::]:80;\n"
+        f"    server_name {domain};\n"
+        "    location ^~ /.well-known/acme-challenge/ {\n"
+        f"        root {webroot};\n"
+        "        default_type \"text/plain\";\n"
+        "        try_files $uri =404;\n"
+        "    }\n"
+        "}\n"
+    )
+    changed=True
 
 conf.write_text("".join(out))
 PY
 
     if [ $? -ne 0 ]; then
-        warn "自动插入 Nginx challenge location 失败"
+        warn "自动修复 Nginx challenge 配置失败"
         [ -n "$backup" ] && [ -f "$backup" ] && cp -a "$backup" "$conf_file" && warn "已恢复 Nginx 配置备份"
         return 1
     fi
@@ -522,8 +582,8 @@ print_acme_paths(){
 advice_for_message(){
     local level="$1" msg="$2"
     case "$msg" in
-        *"Webroot challenge 公网访问测试失败"*) echo "建议：新版已改为 curl -L 跟随跳转，并会本机 --resolve 测试；若仍失败，请检查 DNS/CDN/防火墙或 Nginx 80 server 块。";;
-        *"本机 Webroot 测试通过，但公网测试失败"*) echo "建议：Nginx 本机配置已正常，公网失败多与 DNS、CDN、外部防火墙、回源规则有关。脚本仍会尝试 acme.sh Webroot 签发。";;
+        *"Webroot challenge 公网访问测试失败"*) echo "建议：请看状态码和响应预览。新版会同时测试公网与本机 Nginx；如果本机失败，多半是 Nginx 80 server 块/顶层跳转/默认站点问题。";;
+        *"本机 Webroot 测试通过，但公网测试失败"*) echo "建议：Nginx 本机配置已正常，公网失败多与 DNS、CDN、外部防火墙、回源规则有关。";;
         *"standalone 模式"*) echo "建议：standalone 续签可能需要 80 端口；新版会修复 Webroot，避免停止 Nginx。";;
         *"80 端口当前由 Nginx 占用"*) echo "建议：Nginx 占用 80 是正常网站状态；新版会使用 Webroot，不再停止 Nginx。";;
         *"已移除会停止/启动 Nginx"*) echo "说明：旧版 stop/start hook 已移除，未来续签不会主动停止 Nginx。";;
