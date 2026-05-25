@@ -52,58 +52,21 @@ systemctl restart 3x-ui
 
 ```bash
 xui-ssl-auto-check.sh   # 主检测与修复脚本
-install.sh              # 一键安装脚本模板
+install.sh              # 一键安装脚本
+uninstall.sh            # 一键卸载脚本
 README.md               # 使用说明
 ```
 
 ---
 
-## 一键部署方式
+## 快速开始
 
-上传到 GitHub 后，假设你的仓库地址是：
-
-```bash
-https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME
-```
-
-那么你的脚本 Raw 地址一般是：
-
-```bash
-https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/xui-ssl-auto-check.sh
-```
+### 方式一：一键安装 / 更新，推荐
 
 在 VPS 上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/xui-ssl-auto-check.sh -o /root/xui-ssl-auto-check.sh && chmod +x /root/xui-ssl-auto-check.sh
-```
-
-然后运行：
-
-```bash
-/root/xui-ssl-auto-check.sh
-```
-
-脚本会提示你输入域名：
-
-```bash
-请输入要检测的域名，例如 tim.google.com，仅作格式示例:
-```
-
----
-
-## 一键安装脚本方式
-
-如果你把 `install.sh` 也上传到了 GitHub，可以这样安装：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/install.sh)
-```
-
-如果还没有改 `install.sh` 里的默认仓库地址，也可以用环境变量指定 Raw 地址：
-
-```bash
-RAW_URL="https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/xui-ssl-auto-check.sh" bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/install.sh)
 ```
 
 安装完成后运行：
@@ -112,27 +75,70 @@ RAW_URL="https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/m
 /root/xui-ssl-auto-check.sh
 ```
 
-或者直接带域名运行：
+也可以直接带域名运行：
 
 ```bash
 /root/xui-ssl-auto-check.sh tim.google.com
 ```
 
+> `tim.google.com` 只是格式示例，请替换为你自己的域名。
+
 ---
 
-## 直接运行方式
+### 方式二：不安装，直接运行
 
-你也可以不安装，直接运行：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/xui-ssl-auto-check.sh)
-```
-
-或者带域名运行：
+交互式运行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/xui-ssl-auto-check.sh) tim.google.com
+bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/xui-ssl-auto-check.sh)
 ```
+
+直接带域名运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/xui-ssl-auto-check.sh) tim.google.com
+```
+
+---
+
+### 方式三：手动下载脚本
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/xui-ssl-auto-check.sh -o /root/xui-ssl-auto-check.sh && chmod +x /root/xui-ssl-auto-check.sh
+```
+
+然后运行：
+
+```bash
+/root/xui-ssl-auto-check.sh
+```
+
+---
+
+## 一键卸载
+
+如果你通过一键安装方式安装了脚本，可以执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/uninstall.sh)
+```
+
+或者手动删除：
+
+```bash
+rm -f /root/xui-ssl-auto-check.sh
+```
+
+卸载说明：
+
+- 只删除检测工具本身：`/root/xui-ssl-auto-check.sh`
+- 不删除 acme.sh
+- 不删除 `/root/cert.crt`
+- 不删除 `/root/private.key`
+- 不还原 x-ui 数据库
+- 不删除已有的 acme.sh 续签配置
+
+如果你需要回滚证书路径或 acme.sh hook，请使用脚本运行时自动生成的 `.bak` 备份文件手动恢复。
 
 ---
 
@@ -291,6 +297,18 @@ cat /root/xui-ssl-auto-check.sh
 
 ```bash
 /root/xui-ssl-auto-check.sh --help
+```
+
+更新脚本：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/install.sh)
+```
+
+卸载脚本：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/uninstall.sh)
 ```
 
 ---
