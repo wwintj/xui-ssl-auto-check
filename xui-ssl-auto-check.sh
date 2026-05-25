@@ -11,7 +11,7 @@
 #   4. Ensure renewed cert reloads x-ui / 3x-ui.
 #   5. If Nginx occupies port 80 and acme.sh is standalone:
 #        - Prefer switching to Webroot mode if safe.
-#        - Fallback to pre/post hook: stop nginx before renewal, start nginx after renewal.
+#        - Repair Nginx Webroot challenge without stopping Nginx.
 #   6. Show certificate issue date, expiry date and remaining days.
 #   7. Show detailed WARN / FIX / FAIL reasons and suggestions.
 #
@@ -62,6 +62,7 @@ NGINX_RUNNING=0
 NGINX_80=0
 PORT_443_OCCUPIED=0
 FOUND_WEBROOT=""
+NGINX_DOMAIN_CONF_FILE=""
 
 pass() {
     PASS_COUNT=$((PASS_COUNT + 1))
@@ -380,6 +381,22 @@ get_acme_var() {
     fi
 }
 
+decode_acme_value() {
+    local value="$1"
+
+    if echo "$value" | grep -q "__ACME_BASE64__START_"; then
+        local encoded
+        encoded="$(echo "$value" | sed -E 's/.*__ACME_BASE64__START_([^_]+)__ACME_BASE64__END_.*/\1/')"
+        if command_exists base64 && [ -n "$encoded" ]; then
+            echo "$encoded" | base64 -d 2>/dev/null
+        else
+            echo "$value"
+        fi
+    else
+        echo "$value"
+    fi
+}
+
 set_acme_var() {
     local key="$1"
     local value="$2"
@@ -443,9 +460,11 @@ ensure_acme_install_cert() {
     fi
 
     local reload_cmd
+    local decoded_reload_cmd
     reload_cmd="$(get_acme_var "Le_ReloadCmd")"
+    decoded_reload_cmd="$(decode_acme_value "$reload_cmd")"
 
-    if echo "$reload_cmd" | grep -q "systemctl restart $SERVICE_NAME"; then
+    if echo "$decoded_reload_cmd" | grep -q "systemctl restart $SERVICE_NAME"; then
         pass "续签后会重启 $SERVICE_NAME"
     else
         warn "未确认续签后会重启 $SERVICE_NAME"
@@ -613,6 +632,7 @@ detect_acme_mode() {
 
 find_nginx_webroot_for_domain() {
     FOUND_WEBROOT=""
+    NGINX_DOMAIN_CONF_FILE=""
 
     if ! command_exists nginx; then
         return 1
@@ -649,6 +669,7 @@ find_nginx_webroot_for_domain() {
 
         if [ -n "$root_path" ] && [ -d "$root_path" ]; then
             FOUND_WEBROOT="$root_path"
+            NGINX_DOMAIN_CONF_FILE="$file"
             pass "检测到 Nginx Webroot：$FOUND_WEBROOT"
             info "来源配置文件：$file"
             return 0
@@ -687,24 +708,164 @@ test_webroot_challenge() {
     fi
 }
 
-configure_nginx_stop_start_hooks() {
+remove_nginx_stop_start_hooks_if_present() {
     if [ -z "$ACME_CONF" ] || [ ! -f "$ACME_CONF" ]; then
-        fail "无法配置 Nginx stop/start hook，因为 acme.sh 配置文件不存在"
+        return 0
+    fi
+
+    if grep -Eq "^Le_PreHook=.*(nginx|c3lzdGVtY3RsIHN0b3Agbmdpbng)" "$ACME_CONF" || \
+       grep -Eq "^Le_PostHook=.*(nginx|c3lzdGVtY3RsIHN0YXJ0IG5naW54)" "$ACME_CONF"; then
+        local backup
+        backup="$(backup_file "$ACME_CONF")"
+        if [ -n "$backup" ]; then
+            info "已备份 acme.sh 配置：$backup"
+        fi
+
+        sed -i \
+            -e '/^Le_PreHook=.*nginx/d' \
+            -e '/^Le_PreHook=.*c3lzdGVtY3RsIHN0b3Agbmdpbng/d' \
+            -e '/^Le_PostHook=.*nginx/d' \
+            -e '/^Le_PostHook=.*c3lzdGVtY3RsIHN0YXJ0IG5naW54/d' \
+            "$ACME_CONF"
+
+        fix "已移除会停止/启动 Nginx 的 acme.sh hook"
+    fi
+}
+
+repair_nginx_webroot_challenge() {
+    local webroot="$1"
+    local conf_file="$2"
+
+    if [ -z "$webroot" ] || [ ! -d "$webroot" ]; then
+        warn "无法修复 Webroot：Webroot 目录无效"
         return 1
     fi
 
-    local backup
-    backup="$(backup_file "$ACME_CONF")"
-    if [ -n "$backup" ]; then
-        info "已备份 acme.sh 配置：$backup"
+    if [ -z "$conf_file" ] || [ ! -f "$conf_file" ]; then
+        warn "无法修复 Webroot：未找到对应 Nginx 配置文件"
+        return 1
     fi
 
-    set_acme_var "Le_PreHook" "systemctl stop nginx || true"
-    set_acme_var "Le_PostHook" "systemctl start nginx || true"
+    mkdir -p "$webroot/.well-known/acme-challenge"
+    chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge" 2>/dev/null || true
 
-    fix "已配置续签前自动停止 Nginx"
-    fix "已配置续签后自动启动 Nginx"
-    pass "已避免 standalone 续签时被 Nginx 占用 80 端口阻塞"
+    if test_webroot_challenge "$webroot"; then
+        pass "Webroot challenge 已可访问，无需修改 Nginx 配置"
+        return 0
+    fi
+
+    info "开始修复 Nginx Webroot challenge，不停止 Nginx，仅在测试通过后 reload"
+    local backup
+    backup="$(backup_file "$conf_file")"
+    if [ -n "$backup" ]; then
+        info "已备份 Nginx 配置：$backup"
+    fi
+
+    if ! command_exists python3; then
+        warn "无法自动修复 Nginx 配置：系统未安装 python3"
+        return 1
+    fi
+
+    DOMAIN="$DOMAIN" WEBROOT="$webroot" NGINX_CONF_FILE="$conf_file" python3 <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+domain = os.environ["DOMAIN"]
+webroot = os.environ["WEBROOT"]
+conf = Path(os.environ["NGINX_CONF_FILE"])
+text = conf.read_text()
+
+if "/.well-known/acme-challenge" in text:
+    sys.exit(0)
+
+lines = text.splitlines(True)
+out = []
+changed = False
+idx = 0
+server_start_re = re.compile(r"\bserver\s*\{")
+
+while idx < len(lines):
+    line = lines[idx]
+    if not server_start_re.search(line):
+        out.append(line)
+        idx += 1
+        continue
+
+    block = [line]
+    depth = line.count("{") - line.count("}")
+    idx += 1
+
+    while idx < len(lines) and depth > 0:
+        block.append(lines[idx])
+        depth += lines[idx].count("{") - lines[idx].count("}")
+        idx += 1
+
+    block_text = "".join(block)
+    has_domain = re.search(r"server_name\s+[^;]*\b" + re.escape(domain) + r"\b", block_text)
+
+    if has_domain and not changed:
+        insert = (
+            "\n"
+            "    # Added by xui-ssl-auto-check for acme.sh Webroot renewal\n"
+            "    location ^~ /.well-known/acme-challenge/ {\n"
+            f"        root {webroot};\n"
+            "        default_type \"text/plain\";\n"
+            "        try_files $uri =404;\n"
+            "    }\n"
+        )
+        for j in range(len(block) - 1, -1, -1):
+            if "}" in block[j]:
+                block.insert(j, insert)
+                changed = True
+                break
+
+    out.extend(block)
+
+if not changed:
+    print(f"No matching server block found for {domain}", file=sys.stderr)
+    sys.exit(2)
+
+conf.write_text("".join(out))
+PY
+
+    if [ $? -ne 0 ]; then
+        warn "自动插入 Nginx challenge location 失败"
+        if [ -n "$backup" ] && [ -f "$backup" ]; then
+            cp -a "$backup" "$conf_file"
+            warn "已恢复 Nginx 配置备份"
+        fi
+        return 1
+    fi
+
+    if nginx -t >/tmp/xui_ssl_nginx_test.log 2>&1; then
+        pass "Nginx 配置测试通过"
+        if systemctl reload nginx; then
+            fix "已 reload Nginx，使 Webroot challenge 配置生效"
+        else
+            warn "Nginx reload 失败"
+            cat /tmp/xui_ssl_nginx_test.log 2>/dev/null || true
+            return 1
+        fi
+    else
+        warn "Nginx 配置测试失败，正在恢复备份"
+        cat /tmp/xui_ssl_nginx_test.log
+        if [ -n "$backup" ] && [ -f "$backup" ]; then
+            cp -a "$backup" "$conf_file"
+            nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
+            warn "已恢复 Nginx 配置备份"
+        fi
+        return 1
+    fi
+
+    if test_webroot_challenge "$webroot"; then
+        fix "已修复 Webroot challenge 公网访问"
+        return 0
+    else
+        warn "修复后 Webroot challenge 仍无法公网访问"
+        return 1
+    fi
 }
 
 switch_standalone_to_webroot() {
@@ -712,25 +873,25 @@ switch_standalone_to_webroot() {
         return 0
     fi
 
+    remove_nginx_stop_start_hooks_if_present
+
     if [ "$NGINX_80" -ne 1 ]; then
         pass "standalone 模式下 80 端口未被 Nginx 占用，暂不需要切换模式"
         return 0
     fi
 
-    warn "检测到 standalone + Nginx 占用 80，开始尝试优先切换到 Webroot 模式"
+    warn "检测到 standalone + Nginx 占用 80，将尝试修复 Webroot 模式，避免停止 Nginx"
 
     find_nginx_webroot_for_domain
     if [ -z "$FOUND_WEBROOT" ]; then
-        warn "无法自动找到安全的 Webroot，准备使用 hook 兜底方案"
-        configure_nginx_stop_start_hooks
-        return $?
+        fail "无法自动找到安全的 Webroot；未配置 stop/start Nginx hook，避免影响网站运行"
+        return 1
     fi
 
-    test_webroot_challenge "$FOUND_WEBROOT"
+    repair_nginx_webroot_challenge "$FOUND_WEBROOT" "$NGINX_DOMAIN_CONF_FILE"
     if [ $? -ne 0 ]; then
-        warn "Webroot 条件不满足，准备使用 hook 兜底方案"
-        configure_nginx_stop_start_hooks
-        return $?
+        fail "Webroot 自动修复失败；未配置 stop/start Nginx hook，避免影响网站运行"
+        return 1
     fi
 
     info "正在将 acme.sh 验证方式切换为 Webroot 模式"
@@ -745,12 +906,13 @@ switch_standalone_to_webroot() {
     if [ $? -eq 0 ]; then
         fix "已成功切换为 Webroot 模式并重新签发证书"
         detect_acme
+        detect_acme_mode
+        remove_nginx_stop_start_hooks_if_present
         ensure_acme_install_cert
         return 0
     else
-        warn "Webroot 模式重新签发失败，准备使用 hook 兜底方案"
-        configure_nginx_stop_start_hooks
-        return $?
+        fail "Webroot 模式重新签发失败；未配置 stop/start Nginx hook，避免影响网站运行"
+        return 1
     fi
 }
 
@@ -854,16 +1016,28 @@ advice_for_message() {
             echo "建议：Nginx 正在运行本身不是问题。只有 acme.sh 使用 standalone 模式且需要 80 端口时，才可能影响续签。"
             ;;
         *"80 端口当前由 Nginx 占用"*)
-            echo "建议：需要结合 acme.sh 模式判断。如果是 DNS/Webroot 模式通常没问题；如果是 standalone 模式，脚本会优先尝试 Webroot，失败后配置停止/启动 Nginx 的 hook。"
+            echo "建议：需要结合 acme.sh 模式判断。如果是 DNS/Webroot 模式通常没问题；如果是 standalone 模式，脚本会尝试修复 Webroot，避免停止 Nginx。"
             ;;
         *"443 端口当前有服务监听"*)
             echo "建议：443 被占用通常不影响 HTTP-01 续签；重点关注 80 端口。只要不和 x-ui 面板端口冲突，一般无需处理。"
             ;;
         *"standalone 模式"*)
-            echo "建议：standalone 续签可能需要临时占用 80 端口。如果 80 被 Nginx 占用，建议改 Webroot 或 DNS API；脚本会尝试自动规避冲突。"
+            echo "建议：standalone 续签可能需要临时占用 80 端口。如果 80 被 Nginx 占用，脚本会尝试修复并切换到 Webroot，避免停止 Nginx。"
             ;;
         *"Webroot challenge 公网访问测试失败"*)
-            echo "建议：检查 Nginx 的 server_name、root 目录、/.well-known/acme-challenge/ 是否能公网访问，以及 Cloudflare 是否代理了该域名。"
+            echo "建议：脚本会尝试自动插入 Nginx challenge location 并 reload Nginx。如果仍失败，请检查 server_name、root 目录、防火墙、DNS 解析，以及是否有强制 HTTPS 跳转影响 HTTP-01 验证。"
+            ;;
+        *"未配置 stop/start Nginx hook"*)
+            echo "建议：脚本已避免配置会停止 Nginx 的 hook。请优先修复 Webroot challenge，使证书续签不影响网站运行。"
+            ;;
+        *"已修复 Webroot challenge 公网访问"*)
+            echo "说明：Nginx 已支持 /.well-known/acme-challenge/ 访问，后续可使用 Webroot 模式续签，不需要停止 Nginx。"
+            ;;
+        *"已成功切换为 Webroot 模式"*)
+            echo "说明：acme.sh 已切换到 Webroot 模式，后续续签不需要占用 80 端口，也不会停止 Nginx。"
+            ;;
+        *"已移除会停止/启动 Nginx 的 acme.sh hook"*)
+            echo "说明：已移除旧版本脚本写入的 Nginx stop/start hook，避免未来续签时中断网站服务。"
             ;;
         *"公网 HTTPS 未返回正常状态码"*)
             echo "建议：检查 VPS 防火墙、安全组、Cloudflare 代理状态、面板端口是否放行，以及面板路径是否正确。"
@@ -884,10 +1058,10 @@ advice_for_message() {
             echo "说明：服务已重启以加载新的证书路径或证书文件。建议再次运行脚本确认 HTTPS 状态。"
             ;;
         *"已配置续签前自动停止 Nginx"*)
-            echo "说明：这是 standalone 模式的兜底保护，避免续签时 80 端口被 Nginx 占用。更优方案是未来改为 DNS API 或 Webroot。"
+            echo "说明：旧版本可能配置过 stop/start Nginx hook。新版会优先移除它，并改用 Webroot，避免影响网站运行。"
             ;;
         *"已配置续签后自动启动 Nginx"*)
-            echo "说明：续签完成后会自动恢复 Nginx，降低服务中断时间。"
+            echo "说明：新版不再主动配置停止/启动 Nginx；如看到旧 hook 已移除，说明未来续签不会主动停止 Nginx。"
             ;;
         *)
             if [ "$level" = "FIX" ]; then
