@@ -2,15 +2,11 @@
 set -e
 
 INSTALL_PATH="/root/xui-ssl-auto-check.sh"
-RAW_URL="${RAW_URL:-}"
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/wwintj/xui-ssl-auto-check/main/xui-ssl-auto-check.sh}"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "[FAIL] 请使用 root 权限运行，例如 sudo -i 后再执行"
     exit 1
-fi
-
-if [ -z "$RAW_URL" ]; then
-    RAW_URL="https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/xui-ssl-auto-check.sh"
 fi
 
 echo "Installing x-ui / 3x-ui SSL Auto Check tool..."
