@@ -212,27 +212,32 @@ renew_expiring_cert(){
     if run_acme --renew -d "$DOMAIN" "${ACME_INSTALL_FLAG[@]}" --force; then renew_succeeded "原有配置"; return 0; fi
 
     local key_flag; key_flag="$(acme_key_flag)"
-    case "$ACME_MODE" in
-        nginx|apache|dns|webroot)
-            local mode_args=()
-            case "$ACME_MODE" in
-                nginx) mode_args=(--nginx); [[ "$ACME_WEBROOT" == nginx:?* ]] && mode_args=(--nginx "${ACME_WEBROOT#nginx:}");;
-                apache) mode_args=(--apache);;
-                dns) mode_args=(--dns "$ACME_WEBROOT");;
-                webroot) mode_args=(-w "$ACME_WEBROOT");;
-            esac
-            info "尝试 2：保持 ${ACME_MODE} 验证方式，改用 Let's Encrypt 重新签发"
-            # shellcheck disable=SC2086
-            if run_acme --issue -d "$DOMAIN" "${mode_args[@]}" --server letsencrypt $key_flag --force; then renew_succeeded "Let's Encrypt + ${ACME_MODE}"; return 0; fi
-            ;;
-    esac
-
+    # Webroot goes before another CA attempt: its challenge path is tested locally first, so it does
+    # not burn Let's Encrypt's failed-validation limit (5 per hostname per hour).
     if [ "$ACME_MODE" != "dns" ] && [ "$ACME_MODE" != "webroot" ] && [ "$NGINX_80" -eq 1 ]; then
-        info "尝试 3：改用 Nginx Webroot 方式重新签发（不停止 Nginx）"
+        info "尝试 2：改用 Nginx Webroot 方式重新签发（不停止 Nginx）"
         find_nginx_webroot_for_domain
         if [ -n "$FOUND_WEBROOT" ] && repair_nginx_webroot_challenge "$FOUND_WEBROOT" "$NGINX_DOMAIN_CONF_FILE"; then
             # shellcheck disable=SC2086
             if run_acme --issue -d "$DOMAIN" -w "$FOUND_WEBROOT" --server letsencrypt $key_flag --force; then renew_succeeded "Let's Encrypt + Webroot"; detect_acme_mode; return 0; fi
+        else
+            info "Webroot challenge 本机测试未通过，跳过 Webroot 签发以免消耗 Let's Encrypt 失败次数"
+        fi
+    fi
+
+    # Retrying the same validation method only helps when the original CA was the problem.
+    if ! get_acme_var "Le_API" | grep -q "letsencrypt"; then
+        local mode_args=()
+        case "$ACME_MODE" in
+            nginx) mode_args=(--nginx); [[ "$ACME_WEBROOT" == nginx:?* ]] && mode_args=(--nginx "${ACME_WEBROOT#nginx:}");;
+            apache) mode_args=(--apache);;
+            dns) mode_args=(--dns "$ACME_WEBROOT");;
+            webroot) mode_args=(-w "$ACME_WEBROOT");;
+        esac
+        if [ "${#mode_args[@]}" -gt 0 ]; then
+            info "尝试 3：保持 ${ACME_MODE} 验证方式，改用 Let's Encrypt 重新签发"
+            # shellcheck disable=SC2086
+            if run_acme --issue -d "$DOMAIN" "${mode_args[@]}" --server letsencrypt $key_flag --force; then renew_succeeded "Let's Encrypt + ${ACME_MODE}"; return 0; fi
         fi
     fi
 
@@ -380,7 +385,7 @@ if not changed:
 conf.write_text("".join(out))
 PY
     if [ $? -ne 0 ]; then warn "自动修复 Nginx challenge 配置失败"; [ -n "$backup" ] && [ -f "$backup" ] && cp -a "$backup" "$conf_file" && warn "已恢复 Nginx 配置备份"; return 1; fi
-    if nginx -t >/tmp/xui_ssl_nginx_test.log 2>&1; then pass "Nginx 配置测试通过"; systemctl reload nginx && fix "已 reload Nginx，使 Webroot challenge 配置生效" || { warn "Nginx reload 失败"; return 1; }
+    if nginx -t >/tmp/xui_ssl_nginx_test.log 2>&1; then pass "Nginx 配置测试通过"; systemctl reload nginx && fix "已 reload Nginx，使 Webroot challenge 配置生效" || { warn "Nginx reload 失败"; return 1; }; sleep 3  # reload is async; let new workers take over before testing
     else warn "Nginx 配置测试失败，正在恢复备份"; cat /tmp/xui_ssl_nginx_test.log; [ -n "$backup" ] && [ -f "$backup" ] && cp -a "$backup" "$conf_file"; nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1; warn "已恢复 Nginx 配置备份"; return 1; fi
     if test_webroot_challenge "$webroot" public; then fix "已修复 Webroot challenge 公网访问"; return 0; fi
     if test_webroot_challenge "$webroot" local; then info "本机 Webroot 测试通过，但公网测试失败；仍将尝试使用 Webroot 重新签发"; return 0; fi
