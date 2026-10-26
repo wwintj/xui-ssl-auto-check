@@ -11,7 +11,7 @@ WARN_MESSAGES=(); FAIL_MESSAGES=(); FIX_MESSAGES=()
 DOMAIN=""; SERVICE_NAME=""; XUI_DB=""; PANEL_PORT=""; PANEL_PATH="/"
 ACME_HOME="/root/.acme.sh"; ACME_BIN="${ACME_HOME}/acme.sh"; ACME_CONF=""; ACME_CERT_DIR=""; ACME_KEY_TYPE=""; ACME_MODE=""; ACME_WEBROOT=""
 TARGET_CERT="/root/cert.crt"; TARGET_KEY="/root/private.key"
-NGINX_80=0; FOUND_WEBROOT=""; NGINX_DOMAIN_CONF_FILE=""
+NGINX_80=0; FOUND_WEBROOT=""; NGINX_DOMAIN_CONF_FILE=""; ACME_CHALLENGE_ROOT="/var/www/xui-ssl-acme"
 
 pass(){ PASS_COUNT=$((PASS_COUNT+1)); echo -e "${GREEN}[PASS]${NC} $1"; }
 warn(){ WARN_COUNT=$((WARN_COUNT+1)); WARN_MESSAGES+=("$1"); echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -272,7 +272,12 @@ find_nginx_webroot_for_domain(){
     if [ -z "$files" ]; then warn "未在 Nginx 配置中找到 server_name $DOMAIN"; return 1; fi
     local file root_path
     while read -r file; do [ -z "$file" ] && continue; root_path="$(awk '/^[[:space:]]*#/ {next} /root[[:space:]]+/ {gsub(";","",$0); print $2; exit}' "$file")"; if [ -n "$root_path" ] && [ -d "$root_path" ]; then FOUND_WEBROOT="$root_path"; NGINX_DOMAIN_CONF_FILE="$file"; pass "检测到 Nginx Webroot：$FOUND_WEBROOT"; info "来源配置文件：$file"; return 0; fi; done <<< "$files"
-    warn "找到了域名配置，但未能识别有效 root 目录"; return 1
+    # Reverse-proxy sites have no root: serve challenges from a dedicated directory instead.
+    NGINX_DOMAIN_CONF_FILE="$(grep -lE "^[[:space:]]*listen[[:space:]]+([^;]*:)?80([[:space:];]|$)" $files 2>/dev/null | head -n 1)"
+    [ -z "$NGINX_DOMAIN_CONF_FILE" ] && NGINX_DOMAIN_CONF_FILE="$(echo "$files" | head -n 1)"
+    FOUND_WEBROOT="$ACME_CHALLENGE_ROOT"; mkdir -p "$FOUND_WEBROOT" || { FOUND_WEBROOT=""; warn "无法创建 challenge 目录：$ACME_CHALLENGE_ROOT"; return 1; }
+    info "域名配置中没有 root（反向代理站点），将使用独立 challenge 目录：$FOUND_WEBROOT"; info "来源配置文件：$NGINX_DOMAIN_CONF_FILE"
+    return 0
 }
 
 test_webroot_challenge(){
@@ -321,7 +326,7 @@ domain=os.environ["DOMAIN"]; webroot=os.environ["WEBROOT"]; conf=Path(os.environ
 lines=conf.read_text().splitlines(True); out=[]; idx=0; changed=False
 server_re=re.compile(r"\bserver\s*\{")
 def dd(s): return s.count("{")-s.count("}")
-def listen80(bt): return (not re.search(r"listen\s+", bt)) or bool(re.search(r"listen\s+[^;]*(:)?80\b", bt))
+def listen80(bt): return (not re.search(r"listen\s+", bt)) or bool(re.search(r"listen\s+(\S*:)?80\b", bt))
 def has_domain(bt): return bool(re.search(r"server_name\s+[^;]*\b"+re.escape(domain)+r"\b", bt))
 blocks=[]
 while idx<len(lines):
@@ -332,24 +337,43 @@ while idx<len(lines):
         block.append(lines[idx]); depth+=dd(lines[idx]); idx+=1
     bt="".join(block); blocks.append((True,block,listen80(bt),has_domain(bt)))
 has_exact_80_domain=any(is_s and l80 and hd for is_s,b,l80,hd in blocks)
+def location_block(): return ("\n    # Added by xui-ssl-auto-check for acme.sh Webroot renewal\n    location ^~ /.well-known/acme-challenge/ {\n"+f"        root {webroot};\n"+"        default_type \"text/plain\";\n        try_files $uri =404;\n    }\n")
 def repair(block):
     global changed
-    location=("\n    # Added by xui-ssl-auto-check for acme.sh Webroot renewal\n    location ^~ /.well-known/acme-challenge/ {\n"+f"        root {webroot};\n"+"        default_type \"text/plain\";\n        try_files $uri =404;\n    }\n")
-    new=[]; depth=0
-    for n,line in enumerate(block):
-        if n==0: new.append(line); depth+=dd(line); continue
+    location=location_block()
+    # Server-level return/rewrite (and certbot-style "if (...) { return 301 ... }") run before
+    # location matching and would hijack the challenge, so move them all into one "location /",
+    # keeping their order. Skipped when the block already has its own "location /".
+    redirect_re=re.compile(r"(return\s+|rewrite\s+.*\s+(permanent|redirect)\s*;)")
+    has_root_location=any(re.match(r"location\s+/\s*\{", l.strip()) for l in block)
+    new=[]; moved=[]; insert_at=None; depth=0; n=0
+    while n<len(block):
+        line=block[n]
+        if n==0: new.append(line); depth+=dd(line); n+=1; continue
         stripped=line.strip(); top=(depth==1)
-        if top and (re.match(r"return\s+30[1278]\s+", stripped) or re.match(r"rewrite\s+.*\s+(permanent|redirect)\s*;", stripped)):
-            indent=line[:len(line)-len(line.lstrip())]
-            new.append(f"{indent}location / {{\n{indent}    {stripped}\n{indent}}}\n"); changed=True
-        else: new.append(line)
-        depth+=dd(line)
+        if top and not has_root_location and redirect_re.match(stripped):
+            if insert_at is None: insert_at=len(new)
+            moved.append("    "+line); n+=1; continue
+        if top and not has_root_location and re.match(r"if\s*\(", stripped) and dd(line)>0:
+            j=n+1; d=dd(line); group=[line]
+            while j<len(block) and d>0: group.append(block[j]); d+=dd(block[j]); j+=1
+            if redirect_re.search("".join(group[1:])):
+                if insert_at is None: insert_at=len(new)
+                moved.extend("    "+g for g in group); n=j; continue
+        new.append(line); depth+=dd(line); n+=1
+    if moved:
+        new[insert_at:insert_at]=["    location / {\n"]+moved+["    }\n"]; changed=True
     if ".well-known/acme-challenge" not in "".join(new):
         new.insert(1, location); changed=True
     return new
+def listen443(bt): return bool(re.search(r"listen\s+([^;]*:)?443\b", bt))
 for is_s,b,l80,hd in blocks:
     if not is_s: out.extend(b); continue
+    bt="".join(b)
     if l80 and ((has_exact_80_domain and hd) or (not has_exact_80_domain)): out.extend(repair(b))
+    # Let's Encrypt follows HTTP->HTTPS redirects, so the HTTPS server must serve the challenge too.
+    elif hd and listen443(bt) and ".well-known/acme-challenge" not in bt:
+        b=list(b); b.insert(1, location_block()); out.extend(b); changed=True
     else: out.extend(b)
 if not changed:
     out.append("\n# Added by xui-ssl-auto-check for acme.sh Webroot renewal\nserver {\n    listen 80;\n    listen [::]:80;\n"+f"    server_name {domain};\n"+"    location ^~ /.well-known/acme-challenge/ {\n"+f"        root {webroot};\n"+"        default_type \"text/plain\";\n        try_files $uri =404;\n    }\n}\n")
