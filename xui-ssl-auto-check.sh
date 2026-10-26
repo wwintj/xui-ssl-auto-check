@@ -168,8 +168,81 @@ check_certificate_content(){
     if [ ! -f "$TARGET_CERT" ]; then fail "证书文件不存在：$TARGET_CERT"; return 1; fi
     info "当前 $TARGET_CERT 证书信息："; openssl x509 -in "$TARGET_CERT" -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null
     openssl x509 -in "$TARGET_CERT" -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:${DOMAIN}" && pass "证书 SAN 包含域名：$DOMAIN" || fail "证书 SAN 未包含域名：$DOMAIN"
-    local not_after end_ts now_ts days_left; not_after="$(openssl x509 -in "$TARGET_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)"
-    if [ -n "$not_after" ]; then end_ts="$(date -d "$not_after" +%s 2>/dev/null)"; now_ts="$(date +%s)"; if [ -n "$end_ts" ]; then days_left=$(( (end_ts - now_ts) / 86400 )); info "证书大约还有 $days_left 天过期"; if [ "$days_left" -gt 30 ]; then pass "证书有效期健康"; elif [ "$days_left" -gt 7 ]; then warn "证书将在 30 天内过期，请关注续签"; else fail "证书已经非常接近过期或已经过期"; fi; fi; fi
+    local secs_left days_left; secs_left="$(cert_seconds_left "$TARGET_CERT")"
+    if [ -n "$secs_left" ]; then
+        days_left=$(( secs_left / 86400 ))
+        if [ "$secs_left" -le 0 ]; then fail "证书已经过期 $(( (-secs_left) / 3600 )) 小时"
+        else info "证书大约还有 $days_left 天过期"; if [ "$days_left" -gt 30 ]; then pass "证书有效期健康"; elif [ "$days_left" -gt 7 ]; then warn "证书将在 30 天内过期，请关注续签"; else fail "证书已经非常接近过期"; fi; fi
+    fi
+}
+
+# Seconds until notAfter (negative when already expired); empty when unreadable.
+cert_seconds_left(){
+    local file="$1" not_after end_ts; [ -f "$file" ] || return 1
+    not_after="$(openssl x509 -in "$file" -noout -enddate 2>/dev/null | cut -d= -f2)"; [ -n "$not_after" ] || return 1
+    end_ts="$(date -d "$not_after" +%s 2>/dev/null)"; [ -n "$end_ts" ] || return 1
+    echo $(( end_ts - $(date +%s) ))
+}
+
+ACME_LOG="/tmp/xui_ssl_acme_renew.log"
+run_acme(){
+    # Show acme.sh output live and keep a copy for diagnosis.
+    "$ACME_BIN" "$@" 2>&1 | tee "$ACME_LOG"; return "${PIPESTATUS[0]}"
+}
+
+acme_key_flag(){ [ "$ACME_KEY_TYPE" = "ECC" ] && echo "--keylength ec-256" || echo "--keylength 2048"; }
+
+reinstall_cert(){
+    "$ACME_BIN" --install-cert -d "$DOMAIN" "${ACME_INSTALL_FLAG[@]}" --fullchain-file "$TARGET_CERT" --key-file "$TARGET_KEY" --reloadcmd "systemctl restart $SERVICE_NAME" \
+        && chmod 644 "$TARGET_CERT" 2>/dev/null && chmod 600 "$TARGET_KEY" 2>/dev/null
+}
+
+# acme.sh only renews 60 days after issue (~30 days left on a 90-day cert). If we are already under
+# 30 days the scheduled renewal is failing, so renew now instead of only reporting it.
+renew_expiring_cert(){
+    [ -n "$ACME_CONF" ] && [ -f "$ACME_CONF" ] || return 0
+    local secs_left; secs_left="$(cert_seconds_left "$TARGET_CERT")"
+    if [ -n "$secs_left" ] && [ "$secs_left" -gt $(( 30 * 86400 )) ]; then return 0; fi
+
+    local next_renew; next_renew="$(get_acme_var "Le_NextRenewTimeStr")"
+    line; info "证书已不足 30 天或已过期，说明 acme.sh 自动续签没有成功（计划续签时间：${next_renew:-Unknown}）"
+    systemctl is-active --quiet cron 2>/dev/null || systemctl is-active --quiet crond 2>/dev/null || warn "cron 服务当前未运行，acme.sh 定时续签不会执行"
+
+    info "尝试 1：按 acme.sh 原有配置强制续签"
+    if run_acme --renew -d "$DOMAIN" "${ACME_INSTALL_FLAG[@]}" --force; then renew_succeeded "原有配置"; return 0; fi
+
+    local key_flag; key_flag="$(acme_key_flag)"
+    case "$ACME_MODE" in
+        nginx|apache|dns|webroot)
+            local mode_args=()
+            case "$ACME_MODE" in
+                nginx) mode_args=(--nginx); [[ "$ACME_WEBROOT" == nginx:?* ]] && mode_args=(--nginx "${ACME_WEBROOT#nginx:}");;
+                apache) mode_args=(--apache);;
+                dns) mode_args=(--dns "$ACME_WEBROOT");;
+                webroot) mode_args=(-w "$ACME_WEBROOT");;
+            esac
+            info "尝试 2：保持 ${ACME_MODE} 验证方式，改用 Let's Encrypt 重新签发"
+            # shellcheck disable=SC2086
+            if run_acme --issue -d "$DOMAIN" "${mode_args[@]}" --server letsencrypt $key_flag --force; then renew_succeeded "Let's Encrypt + ${ACME_MODE}"; return 0; fi
+            ;;
+    esac
+
+    if [ "$ACME_MODE" != "dns" ] && [ "$ACME_MODE" != "webroot" ] && [ "$NGINX_80" -eq 1 ]; then
+        info "尝试 3：改用 Nginx Webroot 方式重新签发（不停止 Nginx）"
+        find_nginx_webroot_for_domain
+        if [ -n "$FOUND_WEBROOT" ] && repair_nginx_webroot_challenge "$FOUND_WEBROOT" "$NGINX_DOMAIN_CONF_FILE"; then
+            # shellcheck disable=SC2086
+            if run_acme --issue -d "$DOMAIN" -w "$FOUND_WEBROOT" --server letsencrypt $key_flag --force; then renew_succeeded "Let's Encrypt + Webroot"; detect_acme_mode; return 0; fi
+        fi
+    fi
+
+    fail "证书续签失败，所有自动方式均未成功"
+    info "acme.sh 最后输出（完整日志：$ACME_LOG）："; tail -n 25 "$ACME_LOG" 2>/dev/null
+    return 1
+}
+
+renew_succeeded(){
+    if reinstall_cert; then fix "证书已续签（$1），已安装到 $TARGET_CERT 并重启 $SERVICE_NAME"; else fail "证书已续签，但安装到 $TARGET_CERT 失败"; fi
 }
 
 detect_nginx_and_ports(){
@@ -187,7 +260,8 @@ detect_acme_mode(){
     if [ -z "$ACME_WEBROOT" ]; then ACME_MODE="unknown"; warn "无法识别 acme.sh 当前验证模式，Le_Webroot 为空"
     elif [[ "$ACME_WEBROOT" == dns_* ]]; then ACME_MODE="dns"; pass "当前 acme.sh 是 DNS API 模式：$ACME_WEBROOT"
     elif [ "$ACME_WEBROOT" = "no" ]; then ACME_MODE="standalone"; info "当前 acme.sh 是 standalone 模式，将检查是否需要切换到 Webroot"
-    elif [ "$ACME_WEBROOT" = "nginx" ]; then ACME_MODE="nginx"; warn "当前 acme.sh 是 nginx 模式"
+    elif [ "$ACME_WEBROOT" = "nginx" ] || [[ "$ACME_WEBROOT" == nginx:* ]]; then ACME_MODE="nginx"; info "当前 acme.sh 是 nginx 模式：$ACME_WEBROOT（续签时 acme.sh 会临时修改 Nginx 配置完成验证）"
+    elif [ "$ACME_WEBROOT" = "apache" ] || [[ "$ACME_WEBROOT" == apache:* ]]; then ACME_MODE="apache"; info "当前 acme.sh 是 apache 模式：$ACME_WEBROOT"
     elif [[ "$ACME_WEBROOT" == /* ]]; then ACME_MODE="webroot"; pass "当前 acme.sh 是 Webroot 模式：$ACME_WEBROOT"
     else ACME_MODE="unknown"; warn "无法明确识别 acme.sh 模式：$ACME_WEBROOT"; fi
 }
@@ -319,6 +393,11 @@ check_https_access(){
     info "读取面板端口实际提供的证书"
     local served_cert; served_cert="$(openssl s_client -connect "127.0.0.1:${PANEL_PORT}" -servername "$DOMAIN" -showcerts </dev/null 2>/dev/null | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null || true)"
     [ -n "$served_cert" ] && { pass "面板端口正在提供 TLS 证书"; echo "$served_cert"; } || warn "无法通过 openssl 读取面板端口证书；如果 curl HTTPS 正常，通常问题不大"
+    # curl -k above ignores expiry, so check the served certificate's validity explicitly.
+    if [ -n "$served_cert" ]; then
+        openssl s_client -connect "127.0.0.1:${PANEL_PORT}" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -checkend 0 >/dev/null 2>&1 \
+            && pass "面板端口提供的证书在有效期内" || fail "面板端口提供的证书已过期，浏览器会提示不安全"
+    fi
 }
 
 print_acme_paths(){
@@ -336,6 +415,10 @@ advice_for_message(){
         *"Webroot 自动修复失败"*) echo "建议：查看上方 HTTP 状态码和响应预览。常见原因是默认站点、强制跳转、CDN 或防火墙。";;
         *"已成功切换为 Webroot 模式"*) echo "说明：后续续签将走 Webroot，不需要抢占 80 端口，也不需要停止 Nginx。";;
         *"已 reload Nginx"*) echo "说明：Nginx 已平滑重载，不会像 stop/start 那样中断网站。";;
+        *"证书续签失败"*) echo "建议：查看上方 acme.sh 输出。常见原因：域名开启了 Cloudflare 代理（橙色云）、80 端口被防火墙/安全组拦截、DNS 未指向本机、CA 限流。";;
+        *"证书已续签"*) echo "说明：已立即续签并重启面板，浏览器刷新后即可看到新证书。";;
+        *"cron 服务当前未运行"*) echo "建议：执行 systemctl enable --now cron（CentOS 为 crond），否则证书不会自动续签。";;
+        *"面板端口提供的证书已过期"*) echo "建议：如果本次已续签成功，重新运行脚本复查；否则先解决上方续签失败的问题。";;
         *"已配置 acme.sh install-cert"*) echo "说明：续签后会复制到 /root/cert.crt 和 /root/private.key，并执行 reloadcmd。";;
         *) if [ "$level" = "FIX" ]; then echo "说明：该项目已由脚本自动处理。建议重新运行脚本复查。"; elif [ "$level" = "FAIL" ]; then echo "建议：这是明确异常，需要优先处理。"; else echo "建议：这是风险提醒，不一定是故障。"; fi;;
     esac
@@ -368,9 +451,10 @@ main(){
     line; info "开始检测系统基础信息"; echo "Hostname : $(hostname)"; echo "User     : $(whoami)"; echo "Date     : $(date)"; [ -f /etc/os-release ] && . /etc/os-release && echo "OS       : ${PRETTY_NAME:-Unknown}"; line
     install_sqlite3_if_needed; detect_service; detect_db; detect_panel_port; detect_panel_path
     detect_acme; if [ $? -ne 0 ]; then fail "没有 acme.sh 证书配置，无法继续自动配置续签链路"; print_summary; exit 1; fi
-    ensure_acme_install_cert; ensure_xui_uses_root_cert; check_certificate_content
+    ensure_acme_install_cert; ensure_xui_uses_root_cert
     detect_nginx_and_ports; detect_acme_mode; switch_standalone_to_webroot
-    check_auto_renew; check_https_access; print_acme_paths; print_summary
+    check_auto_renew; renew_expiring_cert; check_certificate_content
+    check_https_access; print_acme_paths; print_summary
 }
 
 main "$@"
